@@ -1,5 +1,16 @@
-/* radar constants */
-#define BUF_SIZE 32
+
+#include <SD.h>
+#include <SPI.h>
+
+/* constants */
+#define BUF_SIZE 512
+
+
+
+
+const int8_t SDCARD_CS_PIN = 10;        //sdcard module chip select pin.
+const int8_t SDCARD_MOSI_PIN  = 11;     //sdcard module out master slave in.
+const int8_t SDCARD_SCK_PIN = 13;       //sdcard module system clock.
 
 // Flag Byte codes
 const unsigned  char  startByte   = 0X7D;
@@ -68,10 +79,11 @@ const long DETECTIONZONE_1_8m = 0X3fe66666;
 const long DETECTIONZONE_2_5m = 0X40200000;
 
 //Sensitivity constants
-const long SENSITIVITY  = 0X0000005;
+const long SENSITIVITY  = 0X00000005;
 
 unsigned char recv_buf[BUF_SIZE];   // Buffer for receiving data from radar. Size is 32 Bytes
-  
+
+static int resetFlag = 0;
 
 //function prototypes
 void send_command(const unsigned char * cmd, int len);
@@ -86,41 +98,65 @@ void set_detetction_zone();
 void set_sensitivity();
 void get_resp_movement();
 void empty_serial_buffer();
-float hexToFloat(unsigned char* hexPtr);
+float getDistance();
+float getMovement();
+void writeToSdCard(String input);
 
 
 //function definitions
-float hexToFloat(unsigned char* hexPtr){
- 
- unsigned char hexToInt[4] = {0};
- unsigned int  signbit;
- unsigned int  exponent;
- unsigned int  mantissa;
- unsigned int  uintVal;
- unsigned int* uintPtr = NULL;
- 
- for(int x = 0; x < 4; x++){
-  hexToInt[x] = *(hexPtr);
-  hexPtr++;
- }
+float getDistance() {
+  unsigned char hexToInt[4] = {0};
+  unsigned int  signbit;
+  unsigned int  exponent;
+  unsigned int  mantissa;
+  unsigned int  uintVal;
+  unsigned int* uintPtr = NULL;
 
- uintPtr = (unsigned int*)(hexToInt);
- uintVal  = *uintPtr;
- signbit =  (uintVal & 0x80000000) >> 31;
- exponent = (uintVal & 0x7F800000) >> 23 ;
- mantissa = (uintVal & 0x007FFFFF) | 0x00800000;
-  
- return (float)((signbit == 1)?-1.0:1.0)*mantissa / pow(2.0, (127 - exponent + 23));
+  hexToInt[3] = recv_buf[21];
+  hexToInt[2] = recv_buf[20];
+  hexToInt[1] = recv_buf[19];
+  hexToInt[0] = recv_buf[18];
+
+  uintPtr =  (unsigned int*)(hexToInt);
+  uintVal  = *uintPtr;
+  signbit =  (uintVal & 0x80000000) >> 31;
+  exponent = (uintVal & 0x7F800000) >> 23 ;
+  mantissa = (uintVal & 0x007FFFFF) | 0x00800000;
+
+  return (float)((signbit == 1) ? -1.0 : 1.0) * mantissa / pow(2.0, (127 - exponent + 23));
+}
+
+
+float getMovement() {
+  unsigned char hexToInt[4] = {0};
+  unsigned int  signbit;
+  unsigned int  exponent;
+  unsigned int  mantissa;
+  unsigned int  uintVal;
+  unsigned int* uintPtr = NULL;
+
+  hexToInt[3] = recv_buf[25];
+  hexToInt[2] = recv_buf[24];
+  hexToInt[1] = recv_buf[23];
+  hexToInt[0] = recv_buf[22];
+
+  uintPtr =  (unsigned int*)(hexToInt);
+  uintVal  = *uintPtr;
+  signbit =  (uintVal & 0x80000000) >> 31;
+  exponent = (uintVal & 0x7F800000) >> 23 ;
+  mantissa = (uintVal & 0x007FFFFF) | 0x00800000;
+
+  return (float)((signbit == 1) ? -1.0 : 1.0) * mantissa / pow(2.0, (127 - exponent + 23));
 }
 
 
 void empty_serial_buffer() {
 
-    while(Serial1.available())
-    {
-      Serial1.read();
-    }
-    Serial.print("\n Serial buffer is emptied...\n");
+  while (Serial1.available())
+  {
+    Serial1.read();
+  }
+  Serial.print("\n Serial buffer is emptied...\n");
 }
 
 
@@ -153,10 +189,24 @@ void send_command(const unsigned char * cmd, int len) {
 
 void reset_module()
 {
-  send_command(&XTS_SPC_MOD_RESET, 1);
+  if (Serial.available() || Serial1.available()) {
+    Serial.clear();
+    Serial1.clear();
+    Serial.printf("\n Serial ports cleared \n");
+    flush_buffer();
+  }
 
   delay(1000);
+  send_command(&XTS_SPC_MOD_RESET, 1);
+  delay(2000);
   receive_data(); // acknowledgement
+
+  if (recv_buf[1] != XTS_SPR_ACK) {
+    //set resetFlag = 1
+    resetFlag = 1;
+    exit(0);
+  }
+
   delay(1000);
   receive_data(); // booting state
   delay(1000);
@@ -170,35 +220,36 @@ int receive_data() {
   char last_char = 0x00;
   int recv_len = 0; //Number of bytes received
 
-  //while(!Serial1.available());
+  while (!Serial1.available());
 
   //Wait for start character
-  while (1)
+  while (Serial1.available())
   {
-    char c = Serial1.read();  // Get one byte from radar
+    char c = Serial1.read();  // Get one byte from X2M200 Xethru module
 
-    if (c == escapeByte)
-    {
+    /*if (c == escapeByte)
+      {
       // If it's an escape character –
       // ...ignore next character in buffer
       //c = Serial1.read();
       continue;
-    }
-    else if (c == startByte)
+      }*/
+
+    if (c == startByte)
     {
       // If it's the start character –
-      // ...we fill the first character of the buffer and move on
+      // We fill the first character of the buffer and move on
       recv_buf[0] = startByte;
-      recv_len = 1;
+      recv_len = 1; //flag to check that a byte is received
       break;
     }
   }
 
   // Start receiving the rest of the bytes
-  while (1)
+  while (Serial1.available())
   {
     // read a byte
-    char cur_char = Serial1.read();  // Get one byte from radar
+    char cur_char = Serial1.read();  // Get one byte from Xethru module
 
     if (cur_char == -1)
     {
@@ -246,14 +297,15 @@ int receive_data() {
   {
     Serial.print("\n Received Data is Correct\n");
 
-    for (int i = 0; i < BUF_SIZE; i++)
-    {
-      Serial.printf("%x  ", recv_buf[i]);
-    }
+    /* for (int i = 0; i < BUF_SIZE; i++)
+      {
+       Serial.printf("%x  ", recv_buf[i]);
+      }*/
 
     Serial.print("\n Received All Data \n");
     return 0;  // Return 0 upon success
   }
+
   else
   {
     Serial.print("\n Received Data is Not Correct \n");
@@ -278,7 +330,7 @@ int receive_data() {
   Serial1.write(XTS_DEF_PINGVAL);
   Serial1.write(crc);
   Serial1.write(stopByte);
- delay(1000);
+  delay(2000);
   receive_data();
 
   }*/
@@ -297,7 +349,7 @@ void load_respiration_app() {
   //Send the command
   send_command(send_buf, 5);
 
-  delay(1000);
+  delay(2000);
   receive_data();
 }
 
@@ -328,7 +380,7 @@ void set_detetction_zone() {
   //Send the command
   send_command(send_buf, 14);
 
-  delay(1000);
+  delay(2000);
   receive_data();
 
 }
@@ -354,7 +406,7 @@ void set_sensitivity() {
   //Send the command
   send_command(send_buf, 10);
 
-  delay(1000);
+  delay(2000);
   receive_data();
 
 }
@@ -370,87 +422,161 @@ void execute_app() {
   //Send the command
   send_command(send_buf, 2);
 
-  delay(1000);
+  delay(2000);
   receive_data();
-  
-}
-
-
-void get_resp_movement() {
-
-  receive_data();
-  float * movement;
-
-  //Point float pointer to the first byte of the float in the buffer
-  movement = (float*)& recv_buf[22];
-  Serial.printf("\n movement = %.2f mm \n", *movement);
 
 }
 
+/*
+void writeToSdCard(String input) {
+
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+
+  // if the file is available, write to it:
+  if (dataFile) {
+    dataFile.println(input);
+    dataFile.close();
+    // print to the serial port too:
+    Serial.println(input);
+  }
+  // if the file isn't open, pop up an error:
+  else {
+    Serial.println("error opening datalog.txt");
+  }
+}
+*/
 
 void setup() {
 
   // put your setup code here, to run once:
+
+  // This initializes the SD card SPI port
+  SPI.setMOSI(SDCARD_MOSI_PIN);   // Audio shield has MOSI on pin 11
+  SPI.setSCK(SDCARD_SCK_PIN );    // Audio shield has SCK on pin 14
+
+  // initialize the serial ports
   Serial.begin(115200);
   delay(1000);
   Serial1.begin(115200);
 
-  empty_serial_buffer();
-  
+  // flushes the junk data if exists from the serial ports
+  if (Serial.available() || Serial1.available()) {
+    Serial.clear();
+    Serial1.clear();
+    Serial.printf("\n Serial ports cleared \n");
+    flush_buffer();
+  }
+
+  //this section confirms the initialization of the SD card
+  Serial.print("Initializing SD card...");
+
+  // see if the card is present and can be initialized:
+  if (!SD.begin(SDCARD_CS_PIN )) {
+    Serial.println("Card failed, or not present");
+    return;
+  }
+  Serial.println("card initialized.");
+
   // start reset
   Serial.print("\n Starting RESET......\n");
   reset_module();
   Serial.print("\n RESET Successfull...\n");
+  empty_serial_buffer();
   flush_buffer();
 
   // load application
   Serial.print("\n Loading Respiration APPLICATION......\n");
   load_respiration_app();
   Serial.print("\n Loading APPLICATION Successfull...\n");
+  empty_serial_buffer();
   flush_buffer();
 
   // set detection zone
   Serial.print("\n Setting Detection Zone......\n");
   set_detetction_zone();
   Serial.print("\n Detection Zone Set Sucessfully...\n");
+  empty_serial_buffer();
   flush_buffer();
 
   // sensitivity
   Serial.print("\n Setting Sensitivity......\n");
   set_detetction_zone();
   Serial.print("\n Sensitivity Set Sucessfully...\n");
+  empty_serial_buffer();
   flush_buffer();
 
   // execute application
   Serial.print("\n Executing Respiration APPLICATION......\n");
   execute_app();
   Serial.print("\n Executing APPLICATION Successfull...\n");
-
-  empty_serial_buffer();
-  flush_buffer();
+  Serial.clear();
+  //empty_serial_buffer();
+  //flush_buffer();
 }
 
 
 
 void loop() {
-    // put your main code here, to run repeatedly:
-    float distance = 0.0; 
-    float movement = 0.0;
-    int state_data = 0;
-    int rpm = 0;
-    
-    empty_serial_buffer();
-    delay(500);
-    receive_data();
-    state_data = (int)recv_buf[10];
-    Serial.printf("\n state data = %d \n",state_data);
-    if(state_data == 0)
-    {
-      rpm = (int)recv_buf[14];
-      distance = hexToFloat(&recv_buf[18]);
-      movement = hexToFloat(&recv_buf[22]);
-      Serial.printf("\n rpm = %d\t\tdistance = %.2fm\t\tmovement = %.2fmm\n",rpm,distance,movement);
+  // put your main code here, to run repeatedly:
+
+  // parameters for the sensor data from X2M200
+  float distance = 0.0;
+  float movement = 0.0;
+  int state_data = 0;
+  int rpm = 0;
+
+  // make a string for assembling the sensor data to log:
+  String dataString = "";
+
+  //empty_serial_buffer();
+  Serial.clear();
+  Serial.flush();
+  Serial1.clear();
+  Serial1.flush();
+  delay(500);
+  receive_data();
+
+  state_data = (int)recv_buf[10];
+  Serial.printf("\n state data = %d \n", state_data);
+
+  if (state_data == 0)
+  {
+    rpm = (int)recv_buf[14];
+    distance = getDistance();
+    movement = getMovement();
+
+    long Time = millis();
+    dataString += String(Time);
+    dataString += ",";
+    dataString += String(rpm);
+    dataString += ",";
+    dataString += String(distance);
+    dataString += ",";
+    dataString += String(movement);
+
+    // open the file. note that only one file can be open at a time,
+    // so you have to close this one before opening another.
+    File dataFile = SD.open("datalog.csv", FILE_WRITE);
+
+    // if the file is available, write to it:
+    if (dataFile) {
+      dataFile.println(dataString);
+      dataFile.close();
+      // print to the serial port too:
+      Serial.println(dataString);
     }
-    //flush_buffer();
- }
- 
+    // if the file isn't open, pop up an error:
+    else {
+      Serial.println("error opening datalog.txt");
+    }
+    
+    //Serial.printf("\n rpm = %d\tdistance = %.2f m\tmovement = %.2f mm\n\n", rpm, distance,movement);
+    //writeToSdCard(dataString);
+    //dataFile.println(dataString);
+    //dataFile.close();
+    
+  }
+
+}
+
